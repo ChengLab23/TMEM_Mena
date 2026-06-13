@@ -1,0 +1,1142 @@
+---
+title: "TMEM and BrCA Metastasis: Reproducible Analysis Code"
+author: "Chenxin Zhang"
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+rm(list = ls())
+
+knitr::opts_chunk$set(
+  error = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  include = FALSE,
+  dpi = 300,
+  comment = NA
+)
+
+set.seed(820)
+
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(survminer)
+library(survival)
+library(prodlim)
+library(gtsummary)
+library(flextable)
+library(officer)
+library(summarytools)
+library(stringr)
+library(purrr)
+library(broom)
+library(janitor)
+library(emmeans)
+library(car)
+
+select <- dplyr::select
+
+code_dir <- if (!is.null(knitr::current_input())) {
+  dirname(normalizePath(knitr::current_input(), mustWork = TRUE))
+} else {
+  getwd()
+}
+
+project_dir <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+data_dir <- if (dir.exists(file.path(code_dir, "data"))) {
+  file.path(code_dir, "data")
+} else {
+  file.path(project_dir, "data")
+}
+results_dir <- file.path(code_dir, "results")
+km_dir <- file.path(results_dir, "km_curves")
+template_docx <- file.path(code_dir, "landscape_example.docx")
+
+setwd(project_dir)
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(km_dir, showWarnings = FALSE, recursive = TRUE)
+
+missing_values <- c(
+  "999-Missing", "9-Missing", "99-Missing", "NULL",
+  "Unable to be Scored", "5-Unknown/Unstaged", "3-Uknown/Indeterminate",
+  "8-UNK", "8=Patient Unavailable", "7=Patient Declined", "3=Unknown",
+  "6-Results not found", "5-Not documented", "4-Unk", "5-No info",
+  "5-No Info", "Unknown", 9999, 999
+)
+
+format_p <- function(x) {
+  ifelse(
+    is.na(x), "",
+    ifelse(
+      x < 0.001, "<0.001",
+      ifelse(x < 0.01, sprintf("%.3f", x), sprintf("%.2f", x))
+    )
+  )
+}
+
+format_p_table1 <- function(x) {
+  ifelse(
+    is.na(x), "",
+    ifelse(x < 0.001, "<0.001", sprintf("%.3f", x))
+  )
+}
+
+new_results_doc <- function() {
+  if (file.exists(template_docx)) {
+    read_docx(template_docx)
+  } else {
+    read_docx()
+  }
+}
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+```
+
+
+# Import and clean the raw data
+```{r}
+rawdf = read_excel(file.path(data_dir, "NSABP Master File.xlsx"), sheet = "Chart Review", na = missing_values) %>%
+  clean_names() %>%
+  rename(id = bank_id) 
+
+master = read_excel(file.path(data_dir, "NSABP Master File.xlsx"), sheet = "Master with Scores", na = missing_values) %>%
+  clean_names() %>%
+  rename(id = bank_id) 
+
+master <- master %>%
+  mutate(across(
+    where(is.character),
+    ~ str_replace(as.character(.), "^\\d+[\\-=]", "")
+  ))
+
+# import the her data
+her_df = read_excel(file.path(data_dir, "NSABP Master File.xlsx"), sheet = "97 HER2 Restains") %>%
+  mutate(her2_tpc = ifelse(`HER2 Result: TPC LAB` %in% c("Tissue Fell Off", "Lymph Node"), NA, `HER2 Result: TPC LAB`)) %>%
+  rename(id = `Sample Number`) %>%
+  select(id, her2_tpc)
+
+# join data
+df = rawdf %>%
+  left_join(master %>% select(-usi), by = "id") %>%
+  left_join(her_df, by = "id")
+
+
+#calculate mena_calc_score
+zscore <- function(x) {
+   (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+ }
+df = df %>% mutate(
+  mena11a_z = zscore(cy5_mean_intensity_mena11a),
+  pan_mena_z = zscore(tritc_mean_intensity_pan_mena),
+  mena_calc_score = pan_mena_z - mena11a_z) %>% select(-mena11a_z,-pan_mena_z)
+
+#filter the data: 814 TMEM Stained Successfully
+df = df %>% filter(a_eligible == "Eligible") %>% filter(b_block_received == "Block Received") %>% filter(c_tmem_stain_status %in%  c("TMEM Stained Successfully, Score 0","TMEM Stained Successfully")) %>% select(-a_eligible,-b_block_received,-c_tmem_stain_status,-protocol,-seq_no,-mena_inv_exclusion_remark,-mena_calc_exlusion_remark,-cytokeratin_mask_area,-cy5_mean_intensity_mena11a,-tritc_mean_intensity_pan_mena,-tritc_mean_intensity_pan_mena)
+```
+
+## clean data
+```{r}
+df = df  %>% mutate(
+  
+  mpsiz = ifelse(mpsiz ==99.9,NA,mpsiz),
+  trt = factor(trt, levels = c(1,2), labels = c("AC", "AC+P")), 
+  
+  mense = ifelse(mense == 9, NA,mense),
+  mense = factor(mense, levels = c(1:3), labels = c("Pre-menopausal", "Currently experiencing","Post-menopausal")),#no unknown value
+  
+  tmast = factor(tmast, levels = c(1,2), labels = c("Lumpectomy + Axillary Dissection", "Mastectomy")),
+  
+  hr = factor(ifelse(er==1 & pr==1, 1,2), levels = c(1,2), labels = c("Negative", "Positive")),
+  
+  er = factor(er, levels = c(1,2), labels = c("Negative", "Positive")),#no "Equivocal" or "Unknown" categories
+  
+  pr = factor(pr, levels = c(1,2), labels = c("Negative", "Positive")),#no "Equivocal", "Unknown"
+  
+  her2_gene_expression = ifelse(her2_3<11.5, "Negative",ifelse(her2_3>=11.5, "Positive",NA)),
+  #combine her2_tpc and her2_gene_expression
+  `her2_tpc_onco` = ifelse(is.na(her2_tpc),her2_gene_expression,her2_tpc),
+  
+  er_her2 = factor(case_when(
+    `her2_tpc_onco` == "Negative" & er == "Negative" ~ "her2-er-",
+    `her2_tpc_onco` == "Positive" & er == "Negative" ~ "her2+er-",
+    `her2_tpc_onco` == "Negative" & er == "Positive" ~ "her2-er+",
+    `her2_tpc_onco` == "Positive" & er == "Positive" ~ "her2+er+",
+    TRUE ~ "Missing at least one"
+  ), levels = c("her2-er-","her2-er+","her2+er-","her2+er+","Missing at least one")),
+  
+  tam = factor(tam, levels = c(0,1), labels = c("N", "Y")),
+  
+  grade = ifelse(grade==9,NA,grade),#group missing to poor-differentiated
+  grade = factor(grade, levels = c(1:3), labels = c("Well-differentiated", "Mode-differentiated", "Poor-differentiated")),
+
+  race2 = case_when(
+    race == 1 ~ 1,
+    race == 2 ~ 2,
+    race == 3 ~ 3,
+    race == 4 ~ 4,
+    race == 5 ~ 5,
+    race == 6 ~ 5,
+    race == 7 ~ 4,
+    race == 8 ~ 4,
+    race == 9 ~ 5,
+    race == 10 ~ 5
+  ),
+  race2 = factor(race2, levels = c(1:5),labels = c("NH-WT", "Hispanic","Black", "Asian", "Other/NA")),
+  
+  mena_inv_score=as.numeric(mena_inv_score),
+  mena_calc_score=as.numeric(mena_calc_score))
+
+
+```
+
+## create time variable: ddfs and DFS, OS
+```{r}
+
+# OS: Overall survival is defined as the time from curative surgery to death from
+# any cause. The OS variables are tos (time) and os (event).
+
+# DFS: Disease-free survival events include local, regional, or distant recurrence;
+# contralateral breast cancer; non-breast second primary cancers; and death before
+# recurrence. Patients are censored at the end of follow-up
+# or at loss to follow-up.
+
+
+# DDFS: Distant disease-free survival focuses on distant metastasis. Events other
+# than distant recurrence are treated as censoring events.
+
+# Variables ending in "_5ys" indicate outcomes administratively truncated at 5 years.
+# For these variables, follow-up time is capped at 60 months; events occurring after
+# 60 months are treated as censored at 60 months.
+
+df = df %>% mutate(
+  
+#outcome(months):
+  locrec = as.numeric(locrec),#Had Local Recurrence 
+  tlocrec = as.numeric(tlocrec),#Time to First local Recurrence
+  
+  regrec= as.numeric(regrec),#Had Regional Recurrence 
+  treg_rec = as.numeric(treg_rec),#Time to First Regional Recurrence
+  
+  disrec = as.numeric(disrec),#Had Distant Recurrence 
+  tdis_rec = as.numeric(tdis_rec),#Time to First Distant Recurrence 
+  
+  secpri = as.numeric(secpri),#Had Second Primary Cancer/ Including Contralateral BC
+  tp2 = as.numeric(tp2),#Time to First Second Primary Cancer 
+  
+  death = as.numeric(death),
+  tlfup = as.numeric(tlfup)#Time to Death or Last Follow-up
+)
+
+# truncation
+df = df %>% rowwise() %>% 
+   mutate(
+  #OS
+     os = death,
+    tos = tlfup,
+    
+   os_5ys = ifelse(tos > 60 , 0, os),
+   tos_5ys = ifelse(tos > 60 ,60 , tos), 
+   
+  #DDFS
+  ddfs = disrec,
+  tddfs = ifelse(ddfs==1, tdis_rec, tlfup),
+  
+  ddfs_5ys = ifelse(tddfs > 60, 0, ddfs),
+  tddfs_5ys = ifelse(tddfs > 60, 60, tddfs),
+  
+  #DFS
+    dfs = ifelse(locrec==0 & regrec==0 & disrec==0 & secpri==0 & death==0, 0,1),
+    tdfs = min(tlocrec, treg_rec, tdis_rec, tp2, tlfup, na.rm = T),
+    
+    dfs_5ys = ifelse(tdfs > 60 , 0, dfs),
+    tdfs_5ys = ifelse(tdfs > 60 ,60 , tdfs)
+    
+    ) %>% ungroup()
+```
+
+## categorize markers by ddfs - tertile, among all samples
+```{r}
+quantile(df$tmem_score, probs = c(0,1/3,2/3,1), na.rm = TRUE)
+quantile(df$mena_inv_score, probs = c(0,1/3,2/3,1), na.rm = TRUE)
+quantile(df$mena_calc_score, probs = c(0,1/3,2/3,1), na.rm = TRUE)
+
+df = df %>% mutate(
+  tmem_tertile = factor(case_when(
+    tmem_score < 1.169908 ~ "Low",
+    tmem_score >= 1.169908 & tmem_score < 10.408976 ~ "Mid",
+    tmem_score >= 10.408976~ "High",
+    TRUE ~ NA
+  ), levels = c("Low", "Mid","High")),
+  
+  mena_inv_tertile = factor(case_when(
+    mena_inv_score < 13.82770 ~ "Low",
+    mena_inv_score >= 13.82770 & mena_inv_score < 18.16060 ~ "Mid",
+    mena_inv_score >= 18.16060~ "High",
+    TRUE ~ NA
+  ), levels = c("Low", "Mid","High")),
+  
+  mena_calc_tertile = factor(case_when(
+    mena_calc_score < -0.11642614 ~ "Low",
+    mena_calc_score >= -0.11642614 & mena_calc_score < 0.07681679 ~ "Mid",
+    mena_calc_score >= 0.07681679~ "High",
+    TRUE ~ NA
+  ), levels = c("Low", "Mid","High"))
+)
+
+df = df %>%
+  mutate(
+    tmem_num = as.numeric(tmem_tertile),
+    tmem_ord = factor(tmem_tertile,
+                              levels = c("Low", "Mid", "High"),
+                              ordered = TRUE),
+    
+    mena_inv_num = as.numeric(mena_inv_tertile),
+    mena_inv_ord = factor(mena_inv_tertile,
+                                  levels = c("Low", "Mid", "High"),
+                                  ordered = TRUE),
+    mena_calc_num = as.numeric(mena_calc_tertile),
+    mena_calc_ord = factor(mena_calc_tertile,
+                                   levels = c("Low", "Mid", "High"),
+                                   ordered = TRUE)
+  )
+```
+
+## final data
+```{r}
+# Create df2 for Cox regression models.
+# In df2, missing tumor size is imputed with the cohort median, and missing tumor
+# grade and HER2 status are retained as explicit "Unknown" categories so that
+# patients with missing covariate values are not excluded from adjusted models.
+# The original df is retained for descriptive tables and unmodified summaries.
+
+df2 <- df %>%
+  mutate(
+    # replace missing tumor size with median
+    mpsiz = ifelse(is.na(mpsiz), median(mpsiz, na.rm = TRUE), mpsiz),
+
+    # recode tumor grade, unknown as separate group
+     grade = factor(ifelse(is.na(grade), "unknown",grade),labels = c("Well-differentiated", "Mode-differentiated", "Poor-differentiated","Unknown")),
+       
+    `her2_tpc_onco` = factor(ifelse(is.na(`her2_tpc_onco`), "unknown",`her2_tpc_onco`),labels = c("Negative","Positive","Unknown"))
+    
+)
+
+
+# Define the ER+/HER2- subgroup in both the original dataset and the modeling
+# dataset. df_sub is used for descriptive summaries, and df2_sub is used for
+# adjusted Cox models.
+
+df_sub = df %>% filter(er_her2 == "her2-er+")
+df2_sub = df2 %>% filter(er_her2 == "her2-er+")
+```
+
+
+## median follow-up of overall survival
+```{r}
+
+# Reverse Kaplan-Meier for follow-up time
+# Replace:
+#   os_time  = overall survival time
+#   os_event = death indicator (1 = death, 0 = censored)
+
+fit_followup <- survfit(
+  Surv(tos, 1 - os) ~ 1,
+  data = df
+)
+
+# Extract quantiles
+q <- quantile(fit_followup, probs = c(0.25, 0.5, 0.75))$quantile
+
+# Convert months to years
+q_years <- q / 12
+
+cat(
+  sprintf(
+    "Median [IQR] follow-up: %.2f [%.2f–%.2f] years",
+    q_years[2],
+    q_years[1],
+    q_years[3]
+  )
+)#Median [IQR] follow-up: 11.60 [11.04–12.31] years
+```
+
+# Mean values of biomarkers of interest
+```{r}
+# mean tmem score
+mean_tmem <- mean(df$tmem_score, na.rm = TRUE)
+sd_tmem <- sd(df$tmem_score, na.rm = TRUE)
+
+cat(
+  sprintf(
+    "TMEM doorway score: %.4f (%.4f)",
+    mean_tmem,
+    sd_tmem
+  )
+)
+
+# mean mena_inv_score
+mean_inv <- mean(df$mena_inv_score, na.rm = TRUE)
+sd_inv <- sd(df$mena_inv_score, na.rm = TRUE)
+
+cat(
+  sprintf(
+    "TMEM doorway score: %.4f (%.4f)",
+    mean_inv,
+    sd_inv
+  )
+)
+
+# mean tmem score
+mean_calc <- mean(df$mena_calc_score, na.rm = TRUE)
+sd_calc <- sd(df$mena_calc_score, na.rm = TRUE)
+
+cat(
+  sprintf(
+    "TMEM doorway score: %.4f (%.4f)",
+    mean_calc,
+    sd_calc
+  )
+)
+```
+
+# Cox Model
+Clinical variables to consider are:
+(a)  Age
+(b)  Tumor grade
+(c)  No. of lymph nodes
+(d)  Estrogen receptor status
+(e)  Tumor size
+(f)  Type of surgery
+(g)  HER2 gene expression
+(h)  Randomization (treatment) arm. 
+## Define all outcomes
+```{r}
+mycovars = "+ age + grade + pnod + er + mpsiz + tmast + her2_tpc_onco + trt"
+subcovars = "+ age + grade + pnod + mpsiz + tmast + trt"
+
+outcomes <- list(
+  DDFS = list(
+    time = "tddfs",
+    event = "ddfs",
+    outcome_label = "DDFS"
+  ),
+  DDFS_5YS = list(
+    time = "tddfs_5ys",
+    event = "ddfs_5ys",
+    outcome_label = "DDFS (5-year)"
+  ),
+  DFS = list(
+    time = "tdfs",
+    event = "dfs",
+    outcome_label = "DFS"
+  ),
+  DFS_5YS = list(
+    time = "tdfs_5ys",
+    event = "dfs_5ys",
+    outcome_label = "DFS (5-year)"
+  )
+)
+
+mylabel = list(
+      age               ~ "Age",
+      grade     ~ "Tumor grade",
+      pnod              ~ "Positive lymph nodes",
+      mpsiz             ~ "Tumor size (cm)",
+      tmast             ~ "Type of surgery",
+      trt               ~ "Treatment"
+    )
+```
+
+## build COX function
+```{r}
+#Centralized data switch for time-varying models
+get_cox_data <- function(outcome_name, interaction, data) {
+  if (interaction != "time_vary") return(data)
+
+  switch(
+    outcome_name,
+    OS       = cox_os,
+    DDFS     = cox_ddfs,
+    DFS      = cox_dfs,
+    OS_5YS   = cox_os_5ys,
+    DDFS_5YS = cox_ddfs_5ys,
+    DFS_5YS  = cox_dfs_5ys,
+    data
+  )
+}
+
+#formular builder
+build_cox_formula <- function(time, event, mymarker, interaction, covars) {
+  as.formula(
+    paste0(
+      "Surv(", time, ", ", event, ") ~ ",
+      mymarker,
+      if (interaction == "time_vary") ":strata(tgroup)" else "",
+      covars
+    )
+  )
+}
+
+#generate table
+make_cox_table <- function(data, mymarker, covars,interaction = "NO") {
+
+  tbls <- purrr::imap(
+    outcomes,
+    function(outcome, outcome_name) {
+
+      f <- build_cox_formula(
+        time  = outcome$time,
+        event = outcome$event,
+        mymarker = mymarker,
+        interaction = interaction,
+        covars = covars
+      )
+
+      d <- get_cox_data(outcome_name, interaction, data)
+      
+      # --- capture warning + print which model caused it ---
+      fit <- withCallingHandlers(
+        coxph(f, data = d, ties = "breslow", model = TRUE, x = TRUE, y = TRUE),
+        warning = function(w) {
+          message("\n⚠️ Cox warning in outcome: ", outcome_name,
+                  "  [", outcome$outcome_label, "]")
+          message("Formula: ", deparse(f))
+          message("Warning: ", conditionMessage(w), "\n")
+          invokeRestart("muffleWarning")
+        }
+      )
+ 
+      tbl_regression(
+        fit,
+        label = mylabel,
+        exponentiate = TRUE,
+        pvalue_fun = format_p
+      ) %>%
+        add_global_p(keep = TRUE) %>%
+        bold_p(t = 0.05) %>%
+        bold_labels() %>%
+        italicize_levels()
+    }
+  )
+
+  ft = tbl_merge(
+    tbls = tbls,
+    tab_spanner = paste0("**", purrr::map_chr(outcomes, "outcome_label"), "**")
+  ) 
+  ft <- ft %>%
+  modify_table_body(
+    ~ .x %>%
+      dplyr::mutate(order_flag = if_else(grepl(":", variable), 0, 1)) %>%
+      dplyr::arrange(order_flag) %>%
+      dplyr::select(-order_flag)
+  )
+  
+  ft = ft %>%
+    as_flex_table() %>%
+    set_table_properties(layout = "autofit") %>%
+    padding(
+      padding.top = 0, padding.bottom = 0,
+      padding.left = 1, padding.right = 1
+    ) %>% autofit() %>% vline(j = c(4,7,10), border = fp_border(color = "black", width = 1))
+# highlight p value
+  for (j in c(4,7,10,13)) {
+
+    pvals <- suppressWarnings(as.numeric(ft$body$dataset[[j]]))# <- force numeric, other wise >0.99 will be red
+  sig_rows <- which(
+  (!is.na(pvals) & pvals < 0.05) |
+  ft$body$dataset[[j]] == "<0.001"
+)
+
+  ft <- ft %>%
+    color(i = sig_rows, j = j, color = "red", part = "body")
+}
+  #change covariate to grey
+  char_col <- names(ft$body$dataset)[1]
+
+  # find the row index where "age" appears
+  age_row <- which(str_detect(ft$body$dataset[[char_col]], "^Age$"))
+
+  # rows to grey = age row to last row
+  rows_to_grey <- age_row:nrow(ft$body$dataset)
+
+  # apply grey color
+  ft = ft %>%
+    color(i = rows_to_grey, color = "grey60", part = "body")
+  
+  ft = ft %>% add_header_lines("Adjusted Cox regression models") %>% bold(i = 1, part = "header")
+  
+}
+
+
+```
+
+## build unadjusted COX function
+```{r}
+make_uni_cox_table <- function(data, mymarker) {
+
+  tbls <- purrr::imap(
+    outcomes,
+    function(outcome, outcome_name) {
+
+      tbl_uvregression(
+        data = data,
+        hide_n = TRUE,
+        method = coxph,
+        y = Surv(!!sym(outcome$time), !!sym(outcome$event)),
+        include = all_of(mymarker),
+        exponentiate = TRUE,
+        pvalue_fun = format_p
+      ) %>%
+        add_global_p(keep = TRUE) %>%
+        bold_p(t = 0.05) %>%
+        bold_labels() %>%
+        italicize_levels()
+    }
+  )
+
+  ft <- tbl_merge(
+    tbls = tbls,
+    tab_spanner = paste0("**", purrr::map_chr(outcomes, "outcome_label"), "**")
+  )
+
+  ft = ft %>%
+    as_flex_table() %>%
+    set_table_properties(layout = "autofit") %>%
+    padding(
+      padding.top = 0, padding.bottom = 0,
+      padding.left = 1, padding.right = 1
+    ) %>%
+    autofit() %>%
+    vline(j = c(4, 7, 10), border = fp_border(color = "black", width = 1))
+
+  for (j in c(4, 7, 10, 13)) {
+    pvals <- suppressWarnings(as.numeric(ft$body$dataset[[j]]))
+    sig_rows <- which(
+      (!is.na(pvals) & pvals < 0.05) |
+        ft$body$dataset[[j]] == "<0.001"
+    )
+
+    ft <- ft %>%
+      color(i = sig_rows, j = j, color = "red", part = "body")
+  }
+
+  ft %>%
+    add_header_lines("Unadjusted Cox regression models") %>%
+    bold(i = 1, part = "header")
+}
+```
+
+
+## creat event table
+```{r}
+make_event_table <- function(data, marker, outcomes){
+
+  purrr::imap_dfr(
+    outcomes,
+    function(outcome, outcome_name){
+
+      data %>%
+        dplyr::filter(!is.na(.data[[marker]])) %>%   # remove NA levels
+        dplyr::group_by(.data[[marker]]) %>%
+        dplyr::reframe(
+          Events = sum(.data[[outcome$event]] == 1, na.rm = TRUE),
+          N = dplyr::n()
+        ) %>%
+        dplyr::mutate(
+          outcome = outcome$outcome_label,
+          value = paste0(Events, " / ", N)
+        ) %>%
+        dplyr::select(!!marker := all_of(marker), outcome, value)
+    }
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = outcome,
+    values_from = value
+  )
+  
+}
+```
+
+
+# Main tables
+
+## Table 1. Patient Characteristics by TMEM Doorway Score Tertiles
+```{r}
+set.seed(820)
+table1 = df %>% dplyr::select(tmem_tertile,age,race2, mense,grade, er,pr, `her2_tpc_onco`,mpsiz,pnod, tmast, trt, tam) %>% 
+  tbl_summary(
+    by = tmem_tertile, 
+    missing = "ifany",
+    missing_text = "(Missing)",
+    digits = list(
+     
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)   # 0 digits for counts, 1 digit for percent
+      
+    ),
+    label = list(
+        age          ~  "Age (years)",
+        race2         ~ "Race",
+        mense         ~ "Menopausal status",
+        grade         ~ "Tumor grade",
+        er            ~ "Estrogen Receptor",
+        pr            ~ "Progesterone Receptor",
+        mpsiz         ~ "Tumor size (cm)",
+        pnod          ~ "Positive lymph nodes",
+        tmast         ~ "Surgery",
+        trt           ~ "Treatment",
+        tam           ~ "Tamoxifen"
+      ),
+    
+    type = list(all_dichotomous() ~ "categorical",all_continuous() ~ "continuous2"),
+    statistic = list(all_continuous() ~ c( 
+                                           "{mean} ({sd})"),
+                     all_categorical() ~ "{n} ({p})"))%>%  
+  add_overall() %>% 
+  add_p(
+  test = list(
+    all_continuous() ~ "aov",
+    all_categorical() ~ "chisq.test"
+  ),
+  test.args = all_categorical() ~ list(simulate.p.value = TRUE),
+  pvalue_fun = format_p_table1
+) %>%   modify_header(label ~ "**Variables**") %>%
+  modify_footnote(everything() ~ NA,all_stat_cols() ~ "Continuous variables were presented as mean (SD) and categorical variables were presented as N (%). P was calculated using ANOVA for continuous variables and chi-square for categorical variables") %>% 
+  bold_labels()%>%  bold_p(t = 0.05) %>% italicize_levels()
+
+table1 = as_flex_table(table1)%>% set_table_properties(layout = "autofit") %>% padding(padding.top = 0, padding.bottom = 0, padding.left = 1, padding.right = 1) %>% autofit()
+table1
+
+```
+
+
+## Save all
+```{r}
+mymarkers = c("tmem_tertile","tmem_score","mena_calc_tertile","mena_calc_score","mena_inv_tertile","mena_inv_score")
+
+doc = new_results_doc()
+
+doc = doc %>% body_add_par("Table 1. Baseline Characteristics by TMEM Doorway Score Tertiles", style = "heading 1")
+doc = doc %>% body_add_flextable(table1)
+
+doc = doc %>% body_add_par("Table 2 / Supplementary Table S4. Adjusted Cox Model Outputs Among All Patients", style = "heading 1")
+
+#####all patients
+for (mymarker in mymarkers){
+
+  doc = doc %>% body_add_par(paste0("All patients - ",mymarker), style = "heading 2") 
+  
+  if (mymarker %in% c("tmem_tertile","mena_calc_tertile","mena_inv_tertile")){
+  event_table <- make_event_table(df2, mymarker, outcomes)
+  event_table_ft <- flextable(event_table) %>%
+  autofit() %>% add_header_lines("Number of Events / Number at Risk by Marker Level")%>% bold(i = 1, part = "header")
+    
+    doc = doc %>% body_add_flextable(event_table_ft) 
+  }
+
+  doc = doc %>% 
+  body_add_flextable(make_uni_cox_table(df2, mymarker)) %>% 
+  body_add_par("", style = "Normal") %>% 
+  body_add_flextable(make_cox_table(df2, mymarker,mycovars)) 
+  
+}
+
+#### subgroup
+doc = doc %>% body_add_par("Tables 4 and 5. Adjusted Cox Model Outputs in the ER+/HER2- Subgroup", style = "heading 1")
+
+for (mymarker in mymarkers){
+
+  doc = doc %>% body_add_par(paste0("ER+/HER2- subgroup - ",mymarker), style = "heading 2") 
+  
+  if (mymarker %in% c("tmem_tertile","mena_calc_tertile","mena_inv_tertile")){
+  event_table <- make_event_table(df2_sub, mymarker, outcomes)
+  event_table_ft <- flextable(event_table) %>%
+  autofit() %>% add_header_lines("Number of Events / Number at Risk by Marker Level")%>% bold(i = 1, part = "header")
+  doc = doc %>% body_add_flextable(event_table_ft) 
+  }
+  doc = doc %>% 
+  body_add_flextable(make_uni_cox_table(df2_sub, mymarker)) %>% 
+  body_add_par("", style = "Normal") %>% 
+  body_add_flextable(make_cox_table(df2_sub, mymarker, subcovars)) 
+  
+}
+
+path = file.path(results_dir, "main_analysis_tables.docx")
+print(doc, path)
+```
+
+
+# Suplementary tables
+
+## Supp Table 2. Patient Characteristics by MenaCalc Score Tertiles
+```{r}
+set.seed(820)
+stable2 = df %>% dplyr::select(mena_calc_tertile,age,race2, mense,grade, er,pr, `her2_tpc_onco`,mpsiz,pnod, tmast, trt, tam) %>% 
+  tbl_summary(
+    by = mena_calc_tertile, 
+    missing = "ifany",
+    missing_text = "(Missing)",
+    digits = list(
+     
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)    # 0 digits for counts, 1 digit for percent
+    ),
+    label = list(
+        age          ~  "Age (years)",
+        race2         ~ "Race",
+        mense         ~ "Menopausal status",
+        grade         ~ "Tumor grade",
+        er            ~ "Estrogen Receptor",
+        pr            ~ "Progesterone Receptor",
+        mpsiz         ~ "Tumor size (cm)",
+        pnod          ~ "Positive lymph nodes",
+        tmast         ~ "Surgery",
+        trt           ~ "Treatment",
+        tam           ~ "Tamoxifen"
+      ),
+    
+    type = list(all_dichotomous() ~ "categorical",all_continuous() ~ "continuous2"),
+    statistic = list(all_continuous() ~ c( 
+                                           "{mean} ({sd})"),
+                     all_categorical() ~ "{n} ({p})"))%>%  
+  add_overall() %>% 
+  add_p(
+  test = list(
+    all_continuous() ~ "aov",
+    all_categorical() ~ "chisq.test"
+  ),
+  test.args = all_categorical() ~ list(simulate.p.value = TRUE),
+  pvalue_fun = format_p_table1
+) %>%   modify_header(label ~ "**Variables**") %>%
+  modify_footnote(everything() ~ NA,all_stat_cols() ~ "Continuous variables were presented as mean (SD) and categorical variables were presented as N (%). P was calculated using ANOVA for continuous variables and chi-square for categorical variables") %>% 
+  bold_labels()%>%  bold_p(t = 0.05) %>% italicize_levels()
+
+stable2 = as_flex_table(stable2)%>% set_table_properties(layout = "autofit") %>% padding(padding.top = 0, padding.bottom = 0, padding.left = 1, padding.right = 1) %>% autofit()
+stable2
+
+```
+
+## Supp Table 3. Patient Characteristics by MenaINV Tertiles
+```{r}
+set.seed(820)
+stable3 = df %>% dplyr::select(mena_inv_tertile,age,race2, mense,grade, er,pr, `her2_tpc_onco`,mpsiz,pnod, tmast, trt, tam) %>% 
+  tbl_summary(
+    by = mena_inv_tertile, 
+    missing = "ifany",
+    missing_text = "(Missing)",
+    digits = list(
+     
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)    # 0 digits for counts, 1 digit for percent
+       
+    ),
+    label = list(
+        age          ~  "Age (years)",
+        race2         ~ "Race",
+        mense         ~ "Menopausal status",
+        grade         ~ "Tumor grade",
+        er            ~ "Estrogen Receptor",
+        pr            ~ "Progesterone Receptor",
+        mpsiz         ~ "Tumor size (cm)",
+        pnod          ~ "Positive lymph nodes",
+        tmast         ~ "Surgery",
+        trt           ~ "Treatment",
+        tam           ~ "Tamoxifen"
+      ),
+    
+    type = list(all_dichotomous() ~ "categorical",all_continuous() ~ "continuous2"),
+    statistic = list(all_continuous() ~ c( 
+                                           "{mean} ({sd})"),
+                     all_categorical() ~ "{n} ({p})"))%>%  
+  add_overall() %>% 
+  add_p(
+  test = list(
+    all_continuous() ~ "aov",
+    all_categorical() ~ "chisq.test"
+  ),
+  test.args = all_categorical() ~ list(simulate.p.value = TRUE),
+  pvalue_fun = format_p_table1
+) %>%   modify_header(label ~ "**Variables**") %>%
+  modify_footnote(everything() ~ NA,all_stat_cols() ~ "Continuous variables were presented as mean (SD) and categorical variables were presented as N (%). P was calculated using ANOVA for continuous variables and chi-square for categorical variables") %>% 
+  bold_labels()%>%  bold_p(t = 0.05) %>% italicize_levels()
+
+stable3 = as_flex_table(stable3)%>% set_table_properties(layout = "autofit") %>% padding(padding.top = 0, padding.bottom = 0, padding.left = 1, padding.right = 1) %>% autofit()
+stable3
+```
+## Supp Table 4. Spearman Correlations (rs) Within TMEM, MenaCalc, and MenaINV in All Patients and the ER+HER2- Subgroup
+
+```{r}
+vars <- c("tmem_score","mena_calc_score","mena_inv_score")
+
+spearman_results <- combn(vars, 2, simplify = FALSE) %>%
+  map_dfr(~{
+    test <- cor.test(
+      df[[.x[1]]],
+      df[[.x[2]]],
+      method = "spearman",
+      exact = FALSE   # recommended for larger samples / ties
+    )
+    tidy(test) %>%
+      mutate(
+        var1 = .x[1],
+        var2 = .x[2],
+        method = "Spearman"
+      )
+  })
+
+spearman_results = spearman_results  %>% mutate(p.value = ifelse(
+      p.value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p.value))) %>% mutate(rho = round(estimate, 3))%>% select(var1, var2,rho,everything()) %>% select(-estimate, -statistic,-method,-alternative)
+spearman_results = flextable(spearman_results)
+spearman_results
+
+spearman_results_sub <- combn(vars, 2, simplify = FALSE) %>%
+  map_dfr(~{
+    test <- cor.test(
+      df_sub[[.x[1]]],
+      df_sub[[.x[2]]],
+      method = "spearman",
+      exact = FALSE   # recommended for larger samples / ties
+    )
+    tidy(test) %>%
+      mutate(
+        var1 = .x[1],
+        var2 = .x[2],
+        method = "Spearman"
+      )
+  })
+
+spearman_results_sub = spearman_results_sub  %>% mutate(p.value = ifelse(
+      p.value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p.value))) %>% mutate(rho = round(estimate, 3))%>% select(var1, var2,rho,everything()) %>% select(-estimate, -statistic,-method,-alternative)
+spearman_results_sub = flextable(spearman_results_sub)
+spearman_results_sub
+```
+
+## Run p trend
+```{r}
+mymarkers = c("tmem_score + mena_calc_score",
+              "tmem_score + mena_inv_score",
+              "tmem_score + mena_calc_score + mena_inv_score",
+              "mena_calc_score + mena_inv_score")
+doc = new_results_doc()
+
+doc = doc %>% body_add_par("Table 3 / Supplementary Table S5 p trend in All Patients", style = "heading 1")
+
+#####all patients
+for (mymarker in mymarkers){
+
+  doc = doc %>% body_add_par(paste0("All patients - ",mymarker), style = "heading 2") 
+
+  doc = doc %>% 
+  body_add_flextable(make_cox_table(df2, mymarker,mycovars)) 
+  
+}
+
+#### subgroup
+doc = doc %>% body_add_par("Table 3 / Supplementary Table S5 p trend in the ER+/HER2- Subgroup", style = "heading 1")
+
+for (mymarker in mymarkers){
+
+  doc = doc %>% body_add_par(paste0("ER+/HER2- subgroup - ",mymarker), style = "heading 2") 
+  
+  doc = doc %>% 
+  body_add_flextable(make_cox_table(df2_sub, mymarker, subcovars)) 
+} 
+
+path = file.path(results_dir, "table3_supplementary_tables5p_trend_tables.docx")
+print(doc, path)
+
+```
+
+
+## Save all
+```{r}
+mymarkers = c("tmem_tertile + mena_calc_tertile",
+              "tmem_tertile + mena_inv_tertile",
+              "tmem_tertile + mena_calc_tertile + mena_inv_tertile",
+              "mena_calc_tertile + mena_inv_tertile")
+doc = new_results_doc()
+
+doc = doc %>% body_add_par("Supplementary Table S2. Baseline Characteristics by MenaCalc Score Tertiles", style = "heading 1")
+doc = doc %>% body_add_flextable(stable2)
+
+doc = doc %>% body_add_par("Supplementary Table S3. Baseline Characteristics by MenaINV Score Tertiles", style = "heading 1")
+doc = doc %>% body_add_flextable(stable3)
+
+doc = doc %>% body_add_par("Additional Analysis. Spearman Correlations within TMEM, MenaCalc, and MenaINV", style = "heading 1")
+doc = doc %>% body_add_par("All Patients:", style = "Normal")
+doc = doc %>% body_add_flextable(spearman_results)
+doc = doc %>% body_add_par("ER+HER2- Subgroup:", style = "Normal")
+doc = doc %>% body_add_flextable(spearman_results_sub)
+
+doc = doc %>% body_add_par("Table 3 / Supplementary Table S5. Mutually Adjusted Associations in All Patients", style = "heading 1")
+
+#####all patients
+for (mymarker in mymarkers){
+
+  doc = doc %>% body_add_par(paste0("All patients - ",mymarker), style = "heading 2") 
+
+  doc = doc %>% 
+  body_add_flextable(make_cox_table(df2, mymarker,mycovars)) 
+  
+}
+
+#### subgroup
+doc = doc %>% body_add_par("Table 3 / Supplementary Table S5. Mutually Adjusted Associations in the ER+/HER2- Subgroup", style = "heading 1")
+
+for (mymarker in mymarkers){
+
+  doc = doc %>% body_add_par(paste0("ER+/HER2- subgroup - ",mymarker), style = "heading 2") 
+  
+  doc = doc %>% 
+  body_add_flextable(make_cox_table(df2_sub, mymarker, subcovars)) 
+} 
+
+path = file.path(results_dir, "supplementary_analysis_tables.docx")
+print(doc, path)
+```
+
+#KM 
+### function to produce one km plot
+
+```{r}
+kmf <- function(my_var,mydata, my_time, my_event, my_title, my_subtitle) {
+  if (my_var == "tmem_tertile"){
+    my_legend = c("Low", "Mid", "High")
+    my_legend_title = "TMEM Doorway Score"
+  } else if (my_var == "mena_calc_tertile"){
+    my_legend = c("Low", "Mid", "High")
+    my_legend_title = expression(Mena^{calc}~"Score")
+  } else if (my_var == "mena_inv_tertile"){
+    my_legend = c("Low", "Mid", "High")
+    my_legend_title = expression(Mena^{INV}~"Score")
+  } 
+  
+  # Create the formula using reformulate() for better reliability
+  surv_formula <- reformulate(my_var, 
+                            response = paste0("Surv(", my_time, ", ", my_event, ")"))
+  
+  
+  #fit the model to extract p value
+  #fit <- survival::survfit(surv_formula, data = mydata)
+#fit$formula <- surv_formula
+
+sd <- survival::survdiff(surv_formula, data = mydata)
+  pval_raw <- 1 - stats::pchisq(sd$chisq, df = length(sd$n) - 1)
+  
+  pval_label <- ifelse(is.na(pval_raw), "", ifelse(pval_raw < 0.001, "P < 0.001", ifelse(pval_raw < 0.01, paste0("P = ", sprintf("%.3f", pval_raw)), paste0("P = ", sprintf("%.2f", pval_raw)))))
+
+
+  # Fit the model with explicit data evaluation for plot
+  fit <- eval(bquote(
+    survfit(.(surv_formula), data = mydata,)
+  ))
+  
+  # Create the plot
+  p1 <- ggsurvplot(
+    fit,
+    data = mydata,
+    title = paste("Kaplan-Meier Curve of", my_title),
+    subtitle = my_subtitle,
+    legend.title = my_legend_title,
+    legend.labs = my_legend,
+    font.title = c(12, "bold", "black"),
+    font.subtitle = c(10, "bold.italic", "black"),
+    font.x = c(10, "italic", "black"),
+    font.y = c(10, "italic", "black"),
+    fontsize = 3,
+    font.tickslab = c(9, "plain", "black"),
+    risk.table.height = 0.25,
+    pval = pval_label, 
+    conf.int = FALSE,
+    risk.table = TRUE,
+    risk.table.col = "strata",
+    linetype = "strata",
+    test.for.trend = FALSE,
+    xlab = "Time (years)",
+    ylab = "Survival",
+    risk.table.y.text = FALSE,
+    font.legend = list(size = 10, color = "black"),
+    xscale = "m_y",          # months → years
+    break.time.by = 12,      # tick every year
+    ggtheme = theme_classic2(base_size = 10)
+  )
+  
+  p1$table <- p1$table + 
+    theme(plot.title = element_text(size = 9))
+  
+  return(p1)
+}
+
+# Example usage:
+#kmf("tmem_tertile",df,"tddfs", "ddfs", "DDFS", "Without truncation")
+```
+### function to generate and save multiple km plots
+```{r}
+
+generate_km_plots <- function(mydata, primary_var, file_tag) {
+  
+  km.ddfs <- kmf(primary_var, mydata, "tddfs", "ddfs", "Distant Disease Free Survival", "Without truncation")
+  km.ddfs.5ys <- kmf(primary_var, mydata, "tddfs_5ys", "ddfs_5ys", "Distant Disease Free Survival", "With 5-year truncation")
+  
+  km.dfs <- kmf(primary_var, mydata, "tdfs", "dfs", "Disease Free Survival", "Without truncation")
+  km.dfs.5ys <- kmf(primary_var, mydata, "tdfs_5ys", "dfs_5ys", "Disease Free Survival", "With 5-year truncation")
+
+  cohort_label <- dplyr::recode(
+    file_tag,
+    "all_sample" = "all_patients",
+    "her2_er_subgroup" = "er_her2",
+    .default = file_tag
+  )
+  marker_label <- dplyr::recode(
+    primary_var,
+    "tmem_tertile" = "tmem_tertile",
+    "mena_calc_tertile" = "menacalc_tertile",
+    "mena_inv_tertile" = "menainv_tertile",
+    .default = primary_var
+  )
+
+  pdf(file.path(km_dir, paste0(cohort_label, "_", marker_label, ".pdf")), width = 10, height = 5)
+
+  arrange_ggsurvplots(list(km.ddfs, km.ddfs.5ys), ncol = 2, nrow = 1)
+  arrange_ggsurvplots(list(km.dfs, km.dfs.5ys), ncol = 2, nrow = 1)
+
+  dev.off()
+}
+```
+
+### produce and save km curves
+```{r}
+for (primary_var in c("tmem_tertile","mena_inv_tertile","mena_calc_tertile")){
+ generate_km_plots(df, primary_var, "all_sample")
+}
+
+for (primary_var in c("tmem_tertile","mena_inv_tertile","mena_calc_tertile")){
+ generate_km_plots(df_sub, primary_var, "her2_er_subgroup")
+}
+```
+
+
+```{r}
+#save distribution tables
+doc = new_results_doc()
+
+doc = doc %>% body_add_par("Table 1. Baseline Characteristics by TMEM Doorway Score Tertiles", style = "heading 1")
+doc = doc %>% body_add_flextable(table1)
+
+doc = doc %>% body_add_par("Supplementary Table S2. Baseline Characteristics by MenaCalc Score Tertiles", style = "heading 1")
+doc = doc %>% body_add_flextable(stable2)
+
+doc = doc %>% body_add_par("Supplementary Table S3. Baseline Characteristics by MenaINV Score Tertiles", style = "heading 1")
+doc = doc %>% body_add_flextable(stable3)
+
+path = file.path(results_dir, "./distribution_tables.docx")
+print(doc, path)
+```
+
